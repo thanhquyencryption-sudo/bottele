@@ -4,7 +4,7 @@ from datetime import datetime
 import html
 import os
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -300,4 +300,5 @@ def cmd_id(m):
     bot.send_message(m.chat.id, text)
 #############################################
 print("🤖 Bot đang chạy...")
+
 bot.infinity_polling(skip_pending=True)
