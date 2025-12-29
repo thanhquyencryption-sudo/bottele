@@ -299,6 +299,28 @@ def cmd_id(m):
     ])
     bot.send_message(m.chat.id, text)
 #############################################
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return  # tắt log rác
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+
 print("🤖 Bot đang chạy...")
 
 bot.infinity_polling(skip_pending=True)
+
