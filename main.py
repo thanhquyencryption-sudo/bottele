@@ -3,7 +3,7 @@ import re
 import asyncio
 from datetime import datetime, timezone
 
-import asyncpg
+import aiosqlite
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -16,27 +16,22 @@ from telegram.ext import (
 # =========================
 # CONFIG (ENV on Render)
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
 
 PAYMENT_CHAT_ID = int(os.getenv("PAYMENT_CHAT_ID", "0") or 0)
 PAYMENT_THREAD_ID = int(os.getenv("PAYMENT_THREAD_ID", "0") or 0)
-PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "")
+PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "").strip()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# SQLite path (nên đặt trong persistent disk, ví dụ /var/data/pay_codes.sqlite3)
+DB_PATH = os.getenv("DB_PATH", "pay_codes.sqlite3").strip()
 
-# Webhook config
-# Cách 1: set WEBHOOK_URL luôn (full url) ví dụ: https://your-app.onrender.com/webhook
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-
-# Cách 2: set WEBHOOK_BASE (base url) ví dụ: https://your-app.onrender.com
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")  # default: /webhook
-
-# Optional: bảo mật thêm (Telegram gửi header X-Telegram-Bot-Api-Secret-Token)
+# Webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()          # ví dụ: https://xxx.onrender.com/webhook
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()        # ví dụ: https://xxx.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
-# Render port
 PORT = int(os.getenv("PORT", "10000") or 10000)
 
 PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
@@ -73,11 +68,11 @@ def is_payment_topic(update: Update) -> bool:
 
     if chat.type not in ("group", "supergroup"):
         return False
-    if chat.id != PAYMENT_CHAT_ID:
+    if int(chat.id) != int(PAYMENT_CHAT_ID):
         return False
     if not getattr(msg, "is_topic_message", False):
         return False
-    if int(msg.message_thread_id or 0) != PAYMENT_THREAD_ID:
+    if int(getattr(msg, "message_thread_id", 0) or 0) != int(PAYMENT_THREAD_ID):
         return False
 
     return True
@@ -104,85 +99,67 @@ async def redirect_private(update: Update):
 
 
 # =========================
-# DB (PostgreSQL / asyncpg)
+# DB (SQLite / aiosqlite)
 # =========================
-async def init_db(pool: asyncpg.Pool):
-    async with pool.acquire() as conn:
-        await conn.execute("""
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS pay_codes (
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-            chat_id BIGINT NOT NULL,
-            thread_id BIGINT NOT NULL,
-            pay_message_id BIGINT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            thread_id INTEGER NOT NULL,
+            pay_message_id INTEGER NOT NULL,
 
-            user_id BIGINT NOT NULL,
+            user_id INTEGER NOT NULL,
             username TEXT,
             full_name TEXT,
 
             code TEXT NOT NULL,
-            attempt_no INT NOT NULL,
+            attempt_no INTEGER NOT NULL,
 
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at TEXT NOT NULL,
 
-            done BOOLEAN NOT NULL DEFAULT FALSE,
-            done_at TIMESTAMPTZ,
-            done_by BIGINT
+            done INTEGER NOT NULL DEFAULT 0,
+            done_at TEXT,
+            done_by INTEGER
         );
         """)
-
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_code ON pay_codes(code);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_user ON pay_codes(user_id);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_done ON pay_codes(done);")
-
-
-async def get_next_attempt_no(pool: asyncpg.Pool, user_id: int) -> int:
-    async with pool.acquire() as conn:
-        cnt = await conn.fetchval("SELECT COUNT(*) FROM pay_codes WHERE user_id=$1;", int(user_id))
-        return int(cnt or 0) + 1
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_code ON pay_codes(code);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_user ON pay_codes(user_id);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_done ON pay_codes(done);")
+        await db.commit()
 
 
-async def get_last_identity(pool: asyncpg.Pool, user_id: int):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+async def get_next_attempt_no(db: aiosqlite.Connection, user_id: int) -> int:
+    cur = await db.execute("SELECT COUNT(*) FROM pay_codes WHERE user_id=?;", (int(user_id),))
+    row = await cur.fetchone()
+    return int((row[0] if row else 0) or 0) + 1
+
+
+async def get_last_identity(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
             SELECT full_name, username
             FROM pay_codes
-            WHERE user_id=$1
+            WHERE user_id=?
             ORDER BY id DESC
             LIMIT 1;
-        """, int(user_id))
+        """, (int(user_id),))
+        row = await cur.fetchone()
         if not row:
             return None, None
-        return (row["full_name"] or ""), (row["username"] or "")
-
-
-def get_pool(app: Application) -> asyncpg.Pool:
-    pool = app.bot_data.get("db_pool")
-    if not pool:
-        raise RuntimeError("DB pool not initialized")
-    return pool
+        return (row[0] or ""), (row[1] or "")
 
 
 async def post_init(app: Application):
     if not BOT_TOKEN:
-        raise SystemExit("❌ Missing BOT_TOKEN env.")
-    if not DATABASE_URL:
-        raise SystemExit("❌ Missing DATABASE_URL (PostgreSQL).")
-
-    pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
-    )
-    app.bot_data["db_pool"] = pool
-    await init_db(pool)
-
-
-async def post_shutdown(app: Application):
-    pool = app.bot_data.get("db_pool")
-    if pool:
-        await pool.close()
+        raise SystemExit("❌ Missing BOT_TOKEN env (set on Render).")
+    if not ADMIN_CHAT_ID:
+        print("⚠️ ADMIN_CHAT_ID chưa set, bot vẫn chạy nhưng không gửi notify admin.")
+    if not PAYMENT_CHAT_ID or not PAYMENT_THREAD_ID:
+        print("⚠️ PAYMENT_CHAT_ID / PAYMENT_THREAD_ID chưa set đúng.")
+    await init_db()
 
 
 # =========================
@@ -242,28 +219,29 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
-    pool = get_pool(context.application)
-    attempt_no = await get_next_attempt_no(pool, user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        attempt_no = await get_next_attempt_no(db, user.id)
 
-    async with pool.acquire() as conn:
-        pay_id = await conn.fetchval("""
+        cur = await db.execute("""
             INSERT INTO pay_codes(
                 chat_id, thread_id, pay_message_id,
                 user_id, username, full_name,
                 code, attempt_no, created_at, done
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),FALSE)
-            RETURNING id;
-        """,
-        int(chat.id),
-        int(thread_id),
-        int(msg.message_id),
-        int(user.id),
-        norm_username(user.username),
-        user.full_name or "",
-        code,
-        int(attempt_no)
-        )
+            VALUES (?,?,?,?,?,?,?,?,?,0);
+        """, (
+            int(chat.id),
+            int(thread_id),
+            int(msg.message_id),
+            int(user.id),
+            norm_username(user.username),
+            user.full_name or "",
+            code,
+            int(attempt_no),
+            now_iso(),
+        ))
+        pay_id = cur.lastrowid
+        await db.commit()
 
     await msg.reply_text(
         "✅ <b>LƯU THÀNH CÔNG</b>\n"
@@ -272,16 +250,17 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Vui lòng chờ admin duyệt.\n\n"
         "⚠️ Không spam gửi trùng mã để tránh lỗi xử lý (có thể bị trừ tiền/không duyệt)."
         "</blockquote>",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
     # Notify admin with button
     if ADMIN_CHAT_ID:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Mark Done", callback_data=f"pay_done:{pay_id}")]
+            [InlineKeyboardButton("✅ Payment confirmation", callback_data=f"pay_done:{pay_id}")]
         ])
 
-        last_full_name, last_username = await get_last_identity(pool, user.id)
+        last_full_name, last_username = await get_last_identity(user.id)
         cur_full_name = user.full_name or ""
         cur_username = norm_username(user.username)
         last_username_norm = norm_username(last_username)
@@ -350,28 +329,29 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Bad data", show_alert=True)
         return
 
-    pool = get_pool(context.application)
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
             SELECT id, chat_id, thread_id, pay_message_id, user_id, full_name, code, done
             FROM pay_codes
-            WHERE id=$1;
-        """, int(pay_id))
+            WHERE id=?;
+        """, (int(pay_id),))
+        row = await cur.fetchone()
 
         if not row:
             await q.answer("Không tìm thấy record.", show_alert=True)
             return
 
-        if bool(row["done"]):
+        (_id, chat_id, thread_id, pay_msg_id, user_id, full_name, code, done) = row
+
+        if int(done) == 1:
             await q.answer("Mã này đã Done rồi.", show_alert=True)
             return
 
-        await conn.execute("""
-            UPDATE pay_codes
-            SET done=TRUE, done_at=NOW(), done_by=$1
-            WHERE id=$2;
-        """, int(ADMIN_CHAT_ID), int(pay_id))
+        await db.execute(
+            "UPDATE pay_codes SET done=1, done_at=?, done_by=? WHERE id=?;",
+            (now_iso(), int(ADMIN_CHAT_ID), int(pay_id))
+        )
+        await db.commit()
 
     try:
         await q.edit_message_reply_markup(reply_markup=None)
@@ -380,36 +360,28 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer("✅ Marked as Done!")
 
-    chat_id = int(row["chat_id"])
-    thread_id = int(row["thread_id"])
-    pay_msg_id = int(row["pay_message_id"])
-    user_id = int(row["user_id"])
-    full_name = row["full_name"] or "User"
-    code = row["code"]
-
     text = (
         "✅ <b>PAY ĐÃ DUYỆT</b>\n"
         "<blockquote>"
         f"• Code: <code>{code}</code>\n"
-        f"• User: {mention_user(user_id, full_name)}\n"
-        "• Trạng thái: <b>DONE</b>"
+        f"• User: {mention_user(int(user_id), full_name or 'User')}"
         "</blockquote>"
     )
 
     try:
         await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
+            chat_id=int(chat_id),
+            message_thread_id=int(thread_id),
             text=text,
             parse_mode=ParseMode.HTML,
-            reply_to_message_id=pay_msg_id,
+            reply_to_message_id=int(pay_msg_id),
             disable_web_page_preview=True,
         )
     except Exception as e:
         print("Send to payment topic failed:", repr(e))
         await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
+            chat_id=int(chat_id),
+            message_thread_id=int(thread_id),
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -423,14 +395,13 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update) or not is_admin(update):
         return
 
-    pool = get_pool(context.application)
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
             SELECT code, user_id, full_name, username, created_at, done
             FROM pay_codes
             ORDER BY id DESC;
         """)
+        rows = await cur.fetchall()
 
     if not rows:
         await update.effective_message.reply_text("Chưa có mã nào.")
@@ -446,15 +417,15 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = ""
     part = 1
 
-    def fmt_row(r):
-        st = "DONE" if bool(r["done"]) else "PENDING"
-        user_mention = mention_user(int(r["user_id"]), r["full_name"] or "User")
-        uname = f"@{norm_username(r['username'])}" if r["username"] else ""
-        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else ""
-        return f"• <code>{r['code']}</code> — {user_mention} {uname} — <b>{st}</b> — {created}\n"
+    def fmt_row(code, user_id, full_name, username, created_at, done):
+        st = "DONE" if int(done) == 1 else "PENDING"
+        user_mention = mention_user(int(user_id), full_name or "User")
+        uname = f"@{norm_username(username)}" if username else ""
+        created = created_at or ""
+        return f"• <code>{code}</code> — {user_mention} {uname} — <b>{st}</b> — {created}\n"
 
     for r in rows:
-        line = fmt_row(r)
+        line = fmt_row(*r)
         if len(buf) + len(line) > MAX_LEN:
             await update.effective_message.reply_text(
                 f"<b>Trang {part}</b>\n{buf}",
@@ -477,33 +448,26 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_webhook_url() -> tuple[str, str]:
     """
     Return (webhook_url, url_path)
-    - webhook_url: full https url for telegram setWebhook
-    - url_path: path for local server
     """
     url_path = WEBHOOK_PATH or "webhook"
 
-    # If user sets full webhook URL, use it
     if WEBHOOK_URL:
-        # Ensure it ends with "/<path>" if they forgot
+        # Nếu WEBHOOK_URL đã có /webhook rồi thì giữ nguyên
         if WEBHOOK_URL.rstrip("/").endswith("/" + url_path):
             return WEBHOOK_URL.rstrip("/"), url_path
         return WEBHOOK_URL.rstrip("/") + "/" + url_path, url_path
 
-    # Else build from base
     if not WEBHOOK_BASE:
-        raise SystemExit(
-            "❌ Missing WEBHOOK_BASE or WEBHOOK_URL.\n"
-            "Ví dụ WEBHOOK_BASE=https://your-app.onrender.com"
-        )
+        raise SystemExit("❌ Missing WEBHOOK_BASE or WEBHOOK_URL env.")
 
     return WEBHOOK_BASE.rstrip("/") + "/" + url_path, url_path
 
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Bạn chưa set BOT_TOKEN trên Render Variables.")
-    if not DATABASE_URL:
-        raise SystemExit("❌ Bạn chưa set DATABASE_URL (PostgreSQL).")
+        raise SystemExit("❌ Bạn chưa set BOT_TOKEN trong Render Variables.")
+    if not PAYMENT_TOPIC_LINK:
+        print("⚠️ PAYMENT_TOPIC_LINK đang trống (redirect private sẽ thiếu link).")
 
     webhook_url, url_path = build_webhook_url()
 
@@ -511,7 +475,6 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -520,16 +483,15 @@ def main():
     app.add_handler(CommandHandler("listpay", listpay))
     app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
-    print("✅ Bot is running (webhook)...")
+    print("✅ Bot is running (webhook)")
     print("Webhook URL:", webhook_url)
+    print("DB_PATH:", DB_PATH)
 
-    # run_webhook sẽ tự setWebhook khi truyền webhook_url
-    # secret_token (nếu set) để Telegram gửi header bảo mật
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=url_path,          # local path
-        webhook_url=webhook_url,    # public https url
+        url_path=url_path,
+        webhook_url=webhook_url,
         secret_token=WEBHOOK_SECRET_TOKEN or None,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
