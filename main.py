@@ -1,331 +1,480 @@
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from datetime import datetime
-import html
 import os
+import re
+import asyncio
+from datetime import datetime, timezone
 
-TOKEN = os.getenv("TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+import asyncpg
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+# =========================
+# CONFIG (ENV on Railway)
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
 
-def safe(s: str) -> str:
-    return html.escape(s or "")
+PAYMENT_CHAT_ID = int(os.getenv("PAYMENT_CHAT_ID", "0") or 0)
+PAYMENT_THREAD_ID = int(os.getenv("PAYMENT_THREAD_ID", "0") or 0)
+PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "")
 
-def tag_user(user) -> str:
-    if getattr(user, "username", None):
-        return f"@{safe(user.username)}"
-    name = safe(user.first_name or "Bạn")
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-def card(title: str, lines: list[str]) -> str:
-    head = f"☰ <b>{safe(title)}</b>\n"
-    sep = "──────────────"
-    body = "\n".join(lines)
-    return f"{head}{sep}\n{body}\n{sep}"
+PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
 
-def fmt_user(u) -> str:
-    full_name = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
-    username = u.username if u.username else "Không có"
-    info = (
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def mention_user(user_id: int, full_name: str) -> str:
+    name = (full_name or "User").replace("<", "").replace(">", "")
+    return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+
+def norm_username(u: str | None) -> str:
+    return (u or "").strip().lstrip("@")
+
+
+def is_admin(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and ADMIN_CHAT_ID and u.id == ADMIN_CHAT_ID)
+
+
+def is_private(update: Update) -> bool:
+    c = update.effective_chat
+    return bool(c and c.type == "private")
+
+
+def is_payment_topic(update: Update) -> bool:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return False
+
+    if chat.type not in ("group", "supergroup"):
+        return False
+    if chat.id != PAYMENT_CHAT_ID:
+        return False
+    if not getattr(msg, "is_topic_message", False):
+        return False
+    if int(msg.message_thread_id or 0) != PAYMENT_THREAD_ID:
+        return False
+
+    return True
+
+
+def should_ignore(update: Update) -> bool:
+    if is_private(update):
+        return False
+    return not is_payment_topic(update)
+
+
+async def redirect_private(update: Update):
+    await update.effective_message.reply_text(
+        "<b>Không hỗ trợ tại đây!</b>\n"
         "<blockquote>"
-        f"• Name: <b>{safe(full_name.strip())}</b>\n"
-        f"• Username: <b>@{safe(username)}</b>\n"
-        f"• ID: <code>{u.id}</code>"
-        "</blockquote>"
-    )
-    return info
-
-def fmt_chat(chat) -> str:
-    title = getattr(chat, "title", None) or (getattr(chat, "first_name", None) or "") + ((" " + chat.last_name) if getattr(chat, "last_name", None) else "")
-    title = title.strip() or "Không có"
-    username = f"@{chat.username}" if getattr(chat, "username", None) else "Không có"
-    chat_type = getattr(chat, "type", "unknown")
-    me = bot.get_me()
-    bot_name = me.first_name
-    info = (
-        "<blockquote>"
-        f"• Type: <b>{safe(chat.type)}</b>\n"
-        f"• Name Chat: <b>{safe(title)}</b>\n"
-        f"• Name Bot: <b>{safe(bot_name)}</b>\n"
-        f"• Username: <b>{safe(username)}</b>\n"
-        f"• ID Chanel Chat: <code>{chat.id}</code>"
-        "</blockquote>"
-    )
-    return info
-
-TOOL_URL = "https://thanhquycoder.id.vn/tool"
-YT_URL = "https://youtube.com/@thanhquycoder"
-
-def view_home(user) -> str:
-    txt = (
-        "<blockquote>"
-        "• <b>Tải Tool</b> – Tải tool và hướng dẫn\n"
-        "• <b>Youtube</b> – Xem kênh Youtube\n"
-        "• <b>Admin</b> – Xem thông tin admin"
-        "</blockquote>"
+        "• Vui lòng tham gia group để tiếp tục: "
+        f"<a href='{PAYMENT_TOPIC_LINK}'>Tham gia</a>\n\n"
+        "• Lệnh: <code>/pay PXXXXXXX</code>\n"
+        "• Ví dụ: <code>/pay P0321669</code>"
+        "</blockquote>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
-    cmds = (
-        "<blockquote>"
-        "/tool\n"
-        "/youtube\n"
-        "/admin\n"
-        "/user\n"
-        "/id"
-        "</blockquote>"
+
+# =========================
+# DB (PostgreSQL / asyncpg)
+# =========================
+async def init_db(pool: asyncpg.Pool):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pay_codes (
+            id BIGSERIAL PRIMARY KEY,
+
+            chat_id BIGINT NOT NULL,
+            thread_id BIGINT NOT NULL,
+            pay_message_id BIGINT NOT NULL,
+
+            user_id BIGINT NOT NULL,
+            username TEXT,
+            full_name TEXT,
+
+            code TEXT NOT NULL,
+            attempt_no INT NOT NULL,
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            done BOOLEAN NOT NULL DEFAULT FALSE,
+            done_at TIMESTAMPTZ,
+            done_by BIGINT
+        );
+        """)
+
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_code ON pay_codes(code);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_user ON pay_codes(user_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_done ON pay_codes(done);")
+
+
+async def get_next_attempt_no(pool: asyncpg.Pool, user_id: int) -> int:
+    async with pool.acquire() as conn:
+        cnt = await conn.fetchval("SELECT COUNT(*) FROM pay_codes WHERE user_id=$1;", int(user_id))
+        return int(cnt or 0) + 1
+
+
+async def get_last_identity(pool: asyncpg.Pool, user_id: int):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT full_name, username
+            FROM pay_codes
+            WHERE user_id=$1
+            ORDER BY id DESC
+            LIMIT 1;
+        """, int(user_id))
+        if not row:
+            return None, None
+        return (row["full_name"] or ""), (row["username"] or "")
+
+
+def get_pool(app: Application) -> asyncpg.Pool:
+    pool = app.bot_data.get("db_pool")
+    if not pool:
+        raise RuntimeError("DB pool not initialized")
+    return pool
+
+
+async def post_init(app: Application):
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Missing BOT_TOKEN env.")
+    if not DATABASE_URL:
+        raise SystemExit("❌ Missing DATABASE_URL (add PostgreSQL on Railway).")
+
+    # Railway DATABASE_URL thường ok với asyncpg
+    pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
+    )
+    app.bot_data["db_pool"] = pool
+    await init_db(pool)
+
+
+async def post_shutdown(app: Application):
+    pool = app.bot_data.get("db_pool")
+    if pool:
+        await pool.close()
+
+
+# =========================
+# COMMANDS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_private(update):
+        if is_admin(update):
+            await update.effective_message.reply_text("Admin work")
+        else:
+            await redirect_private(update)
+        return
+
+    if should_ignore(update):
+        return
+
+    await update.effective_message.reply_text(
+        "✅ Payment topic.\n"
+        "Cú pháp: /pay P1234567 (P + 7 số)"
     )
 
-    return card("Menu Bot", [
-        f"Xin chào {tag_user(user)}! Bot đã sẵn sàng.",
-        "",
-        "- <b>Chức năng</b>:",
-        txt,
-        "",
-        "- <b>Lệnh nhanh</b>:",
-        cmds,
-    ])
 
-def view_tool() -> str:
-    return card("Tải Tool", [
-        f"<blockquote><b>Link tải</b>: {TOOL_URL}</blockquote>",
-        "",
-        "<blockquote>✍ <b>Lưu ý:</b> Nếu link lỗi vui lòng inbox <b>Admin</b> để được hỗ trợ nhanh nhất!</blockquote>"
-    ])
-
-def view_youtube() -> str:
-    return card("Youtube", [
-        f"<blockquote><b>Kênh Youtube</b>: {YT_URL}</blockquote>",
-        "",
-        "<blockquote>☞ <i>Ủng hộ mình 1 like và 1 subscribe nhé!</i></blockquote>",
-    ])
-
-def view_admin(chat_id: int) -> str:
-    try:
-        admin = bot.get_chat_member(chat_id, ADMIN_ID)
-        u = admin.user
-
-        full_name = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
-        username = "@" + u.username if u.username else "Không có"
-
-        return card("Thông Tin Admin", [
-            "<blockquote>",
-            f"• Name: <b>{safe(full_name.strip())}</b>\n"
-            f"• Username: <b>{safe(username)}</b>\n"
-            f"• ID: <code>{u.id}</code>\n"
-            f"• Quyền: <b>{safe(admin.status)}</b>"
-            "</blockquote>",
-        ])
-    except:
-        return card("Thông Tin Admin", [
-            "<blockquote>! Không lấy được thông tin admin.</blockquote>"
-        ])
-
-def view_user(m) -> str:
-    target = None
-    if m.reply_to_message:
-        target = m.reply_to_message.from_user
-    elif len(m.text.split()) > 1:
-        username = m.text.split()[1].lstrip("@").lower()
-        try:
-            members = bot.get_chat_administrators(m.chat.id)
-            for mem in members:
-                if mem.user.username and mem.user.username.lower() == username:
-                    target = mem.user
-                    break
-        except:
-            pass
-    if not target:
-        target = m.from_user
-    time_str = datetime.fromtimestamp(m.date).strftime("%d/%m/%Y %H:%M:%S")
-    full_name = (target.first_name or "") + (" " + target.last_name if target.last_name else "")
-    username = "@" + target.username if target.username else "Không có"
-
-    info = (
-        "<blockquote>\n"
-        f"• Name      : <b>{safe(full_name.strip())}</b>\n"
-        f"• Username  : <b>{safe(username)}</b>\n"
-        f"• ID        : <code>{target.id}</code>\n"
-        f"• Thời gian : <b>{safe(time_str)}</b>\n"
-        "</blockquote>"
-    )
-
-    hint = (
-        "<blockquote>\n"
-        "Gợi ý: Gõ /user để lấy thông tin người dùng theo reply hoặc username.\n"
-        "Ví dụ: /user thanhquycoder"
-        "</blockquote>"
-    )
-    return card("Thông Tin User", [info, "", hint])
-
-def kb_home():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("⇩ Tải Tool", callback_data="tool"),
-        InlineKeyboardButton("🔥 Youtube", callback_data="youtube"),
-    )
-    kb.add(InlineKeyboardButton("✦ Admin", callback_data="admin"))
-    return kb
-
-def kb_back(extra: list[InlineKeyboardButton] | None = None):
-    kb = InlineKeyboardMarkup(row_width=2)
-    if extra:
-        kb.add(*extra)
-    kb.add(
-        InlineKeyboardButton("⇦ Quay lại", callback_data="home"),
-        InlineKeyboardButton("↻ Làm mới", callback_data="refresh"),
-    )
-    return kb
-
-def kb_tool():
-    return kb_back([
-        InlineKeyboardButton("🌐 Mở Link Tool", url=TOOL_URL),
-    ])
-
-def kb_youtube():
-    return kb_back([
-        InlineKeyboardButton("🌐 Mở link Youtube", url=YT_URL),
-    ])
-
-def show(c_or_m, text: str, markup=None, edit=False):
-    if edit:
-        bot.edit_message_text(
-            text,
-            c_or_m.message.chat.id,
-            c_or_m.message.message_id,
-            reply_markup=markup
-        )
-    else:
-        bot.send_message(c_or_m.chat.id, text, reply_markup=markup)
-
-@bot.message_handler(commands=["start"])
-def start(m):
-    bot.send_message(m.chat.id, view_home(m.from_user), reply_markup=kb_home())
-
-@bot.callback_query_handler(func=lambda c: True)
-def cb(c):
-    try:
-        if c.data == "home":
-            show(c, view_home(c.from_user), kb_home(), edit=True)
-
-        elif c.data == "tool":
-            show(c, view_tool(), kb_tool(), edit=True)
-
-        elif c.data == "youtube":
-            show(c, view_youtube(), kb_youtube(), edit=True)
-
-        elif c.data == "admin":
-            show(c, view_admin(c.message.chat.id), kb_back(), edit=True)
-
-        elif c.data == "refresh":
-            cur = c.message.text or ""
-            bot.edit_message_text(
-                cur,
-                c.message.chat.id,
-                c.message.message_id,
-                reply_markup=c.message.reply_markup
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Private
+    if is_private(update):
+        if is_admin(update):
+            await update.effective_message.reply_text(
+                "Admin chat riêng không nhận /pay.\n"
+                "User phải nhập /pay trong Topic Payment."
             )
-    except:
-        bot.send_message(c.message.chat.id, view_home(c.from_user), reply_markup=kb_home())
+        else:
+            await redirect_private(update)
+        return
 
-    bot.answer_callback_query(c.id)
+    if should_ignore(update):
+        return
 
-@bot.message_handler(commands=["tool"])
-def cmd_tool(m):
-    bot.send_message(m.chat.id, view_tool(), reply_markup=kb_tool())
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    thread_id = int(getattr(msg, "message_thread_id", 0) or 0)
 
-@bot.message_handler(commands=["youtube"])
-def cmd_youtube(m):
-    bot.send_message(m.chat.id, view_youtube(), reply_markup=kb_youtube())
+    warn_text = (
+        "⚠️ <b>LỆNH KHÔNG HỢP LỆ</b>\n"
+        "<blockquote>"
+        "• Cú pháp: <code>/pay PXXXXXXX</code>\n"
+        "• Ví dụ: <code>/pay P0321669</code>"
+        "</blockquote>"
+    )
 
-@bot.message_handler(commands=["admin"])
-def cmd_admin(m):
-    bot.send_message(m.chat.id, view_admin(m.chat.id), reply_markup=kb_back())
+    if not context.args or len(context.args) != 1:
+        await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
+        return
 
-@bot.message_handler(commands=["user"])
-def cmd_user(m):
-    bot.send_message(m.chat.id, view_user(m), reply_markup=kb_home())
+    code = (context.args[0] or "").strip()
+    if not PAY_RE.match(code):
+        await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
+        return
 
-@bot.message_handler(commands=["id"])
-def cmd_id(m):
-    args = m.text.split(maxsplit=1)
-    sub = args[1].strip().lower() if len(args) > 1 else ""
-    if sub in ["channel", "kenh", "kênh"]:
-        try:
-            if m.chat.type == "channel":
-                info = (
-                    "<b>Channel hiện tại</b>: "
-                    + fmt_chat(m.chat)
-                )
-                text = f"<blockquote>{info}</blockquote>"
-                return bot.send_message(m.chat.id, text)
+    pool = get_pool(context.application)
+    attempt_no = await get_next_attempt_no(pool, user.id)
 
-            fchat = getattr(m, "forward_from_chat", None)
-            if fchat and getattr(fchat, "type", "") == "channel":
-                info = (
-                    "<b>Channel từ tin nhắn forward</b>: "
-                    + fmt_chat(fchat)
-                )
-                text = f"<blockquote>{info}</blockquote>"
-                return bot.send_message(m.chat.id, text)
-
-            if m.reply_to_message:
-                fchat2 = getattr(m.reply_to_message, "forward_from_chat", None)
-                if fchat2 and getattr(fchat2, "type", "") == "channel":
-                    info = (
-                        "<b>Channel từ tin nhắn reply/forward</b>: "
-                        + fmt_chat(fchat2)
-                    )
-                    text = f"<blockquote>{info}</blockquote>"
-                    return bot.send_message(m.chat.id, text)
-        except:
-            pass
-
-        info = (
-            "<b>! Chưa lấy được ID kênh.</b>\n\n"
-            "* <b>Hướng dẫn</b>:\n"
-            "1) Thêm bot vào kênh (cấp quyền admin) rồi gõ: <code>/id channel</code> ngay trong kênh\n"
-            "2) Hoặc forward 1 bài từ kênh vào bot, rồi gõ: <code>/id channel</code>"
+    async with pool.acquire() as conn:
+        pay_id = await conn.fetchval("""
+            INSERT INTO pay_codes(
+                chat_id, thread_id, pay_message_id,
+                user_id, username, full_name,
+                code, attempt_no, created_at, done
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),FALSE)
+            RETURNING id;
+        """,
+        int(chat.id),
+        int(thread_id),
+        int(msg.message_id),
+        int(user.id),
+        norm_username(user.username),
+        user.full_name or "",
+        code,
+        int(attempt_no)
         )
-        text = f"<blockquote>{info}</blockquote>"
-        return bot.send_message(m.chat.id, text)
-    
-    text = card("Thông Tin ID", [
-        "- <b>Người Dùng</b>:",
-        fmt_user(m.from_user),
-        "",
-        "- <b>Chanel Chat</b>:",
-        fmt_chat(m.chat),
-    ])
-    bot.send_message(m.chat.id, text)
-#############################################
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import os
 
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
+    await msg.reply_text(
+        "✅ <b>LƯU THÀNH CÔNG</b>\n"
+        "<blockquote>"
+        "Mã thanh toán của bạn đã được ghi nhận.\n"
+        "Vui lòng chờ admin duyệt.\n\n"
+        "⚠️ Không spam gửi trùng mã để tránh lỗi xử lý (có thể bị trừ tiền/không duyệt)."
+        "</blockquote>",
+        parse_mode=ParseMode.HTML
+    )
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
+    # Notify admin with button
+    if ADMIN_CHAT_ID:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Mark Done", callback_data=f"pay_done:{pay_id}")]
+        ])
 
-        def do_HEAD(self):
-            self.send_response(200)
-            self.end_headers()
+        last_full_name, last_username = await get_last_identity(pool, user.id)
+        cur_full_name = user.full_name or ""
+        cur_username = norm_username(user.username)
+        last_username_norm = norm_username(last_username)
 
-        def log_message(self, format, *args):
+        name_changed = bool(last_full_name) and (last_full_name != cur_full_name)
+        username_changed = bool(last_username) and (last_username_norm != cur_username)
+
+        warn_lines = []
+        if name_changed:
+            warn_lines.append(
+                "⚠️ <b>Cảnh báo:</b> User có dấu hiệu <b>đổi tên</b>\n"
+                f"   • Trước: <code>{last_full_name}</code>\n"
+                f"   • Nay: <code>{cur_full_name}</code>"
+            )
+        if username_changed:
+            warn_lines.append(
+                "⚠️ <b>Cảnh báo:</b> User có dấu hiệu <b>đổi username</b>\n"
+                f"   • Trước: <code>@{last_username_norm}</code>\n"
+                f"   • Nay: <code>@{cur_username}</code>"
+            )
+        warn_block = ("\n\n" + "\n".join(warn_lines)) if warn_lines else ""
+
+        admin_text = (
+            "📥 <b>Pay Requests</b>\n"
+            f"• ID: <code>{pay_id}</code>\n"
+            f"• Code: <code>{code}</code>\n"
+            f"• Attempt: <b>{attempt_no}</b>\n"
+            f"• User: {mention_user(user.id, cur_full_name)}\n"
+            f"• Username: @{cur_username if cur_username else '(none)'}\n"
+            f"• User ID: <code>{user.id}</code>\n"
+            f"• Group: <code>{chat.id}</code>\n"
+            f"• Thread: <code>{thread_id}</code>\n"
+            f"• Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            f"{warn_block}"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            print("Send to admin failed:", repr(e))
+
+
+async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+
+    if not q.from_user or q.from_user.id != ADMIN_CHAT_ID:
+        await q.answer("No permission.", show_alert=True)
+        return
+
+    data = q.data or ""
+    if not data.startswith("pay_done:"):
+        await q.answer()
+        return
+
+    try:
+        pay_id = int(data.split(":", 1)[1])
+    except Exception:
+        await q.answer("Bad data", show_alert=True)
+        return
+
+    pool = get_pool(context.application)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, chat_id, thread_id, pay_message_id, user_id, full_name, code, done
+            FROM pay_codes
+            WHERE id=$1;
+        """, int(pay_id))
+
+        if not row:
+            await q.answer("Không tìm thấy record.", show_alert=True)
             return
 
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+        if bool(row["done"]):
+            await q.answer("Mã này đã Done rồi.", show_alert=True)
+            return
 
-threading.Thread(target=start_health_server, daemon=True).start()
+        await conn.execute("""
+            UPDATE pay_codes
+            SET done=TRUE, done_at=NOW(), done_by=$1
+            WHERE id=$2;
+        """, int(ADMIN_CHAT_ID), int(pay_id))
 
-print("🤖 Bot đang chạy...")
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
-bot.infinity_polling(skip_pending=True)
+    await q.answer("✅ Marked as Done!")
+
+    chat_id = int(row["chat_id"])
+    thread_id = int(row["thread_id"])
+    pay_msg_id = int(row["pay_message_id"])
+    user_id = int(row["user_id"])
+    full_name = row["full_name"] or "User"
+    code = row["code"]
+
+    text = (
+        "✅ <b>PAY ĐÃ DUYỆT</b>\n"
+        "<blockquote>"
+        f"• Code: <code>{code}</code>\n"
+        f"• User: {mention_user(user_id, full_name)}\n"
+        "• Trạng thái: <b>DONE</b>"
+        "</blockquote>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=pay_msg_id,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        print("Send to payment topic failed:", repr(e))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
+# =========================
+# ADMIN: LISTPAY (private only)
+# =========================
+async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private(update) or not is_admin(update):
+        return
+
+    pool = get_pool(context.application)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT code, user_id, full_name, username, created_at, done
+            FROM pay_codes
+            ORDER BY id DESC;
+        """)
+
+    if not rows:
+        await update.effective_message.reply_text("Chưa có mã nào.")
+        return
+
+    total = len(rows)
+    await update.effective_message.reply_text(
+        f"🗂 <b>DANH SÁCH PAY (FULL)</b>\nTổng: <b>{total}</b> mã",
+        parse_mode=ParseMode.HTML
+    )
+
+    MAX_LEN = 3800
+    buf = ""
+    part = 1
+
+    def fmt_row(r):
+        st = "DONE" if bool(r["done"]) else "PENDING"
+        user_mention = mention_user(int(r["user_id"]), r["full_name"] or "User")
+        uname = f"@{norm_username(r['username'])}" if r["username"] else ""
+        created = r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else ""
+        return f"• <code>{r['code']}</code> — {user_mention} {uname} — <b>{st}</b> — {created}\n"
+
+    for r in rows:
+        line = fmt_row(r)
+        if len(buf) + len(line) > MAX_LEN:
+            await update.effective_message.reply_text(
+                f"<b>Trang {part}</b>\n{buf}",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            part += 1
+            buf = ""
+            await asyncio.sleep(0.6)
+        buf += line
+
+    if buf.strip():
+        await update.effective_message.reply_text(
+            f"<b>Trang {part}</b>\n{buf}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Bạn chưa set BOT_TOKEN trên Railway Variables.")
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("listpay", listpay))
+    app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
+
+    print("✅ Bot is running (polling)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
