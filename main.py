@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 # =========================
-# CONFIG (ENV on Railway)
+# CONFIG (ENV on Render)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
@@ -24,6 +24,20 @@ PAYMENT_THREAD_ID = int(os.getenv("PAYMENT_THREAD_ID", "0") or 0)
 PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Webhook config
+# Cách 1: set WEBHOOK_URL luôn (full url) ví dụ: https://your-app.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+
+# Cách 2: set WEBHOOK_BASE (base url) ví dụ: https://your-app.onrender.com
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook").strip().lstrip("/")  # default: /webhook
+
+# Optional: bảo mật thêm (Telegram gửi header X-Telegram-Bot-Api-Secret-Token)
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+
+# Render port
+PORT = int(os.getenv("PORT", "10000") or 10000)
 
 PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
 
@@ -153,9 +167,8 @@ async def post_init(app: Application):
     if not BOT_TOKEN:
         raise SystemExit("❌ Missing BOT_TOKEN env.")
     if not DATABASE_URL:
-        raise SystemExit("❌ Missing DATABASE_URL (add PostgreSQL on Railway).")
+        raise SystemExit("❌ Missing DATABASE_URL (PostgreSQL).")
 
-    # Railway DATABASE_URL thường ok với asyncpg
     pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
@@ -461,19 +474,66 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def build_webhook_url() -> tuple[str, str]:
+    """
+    Return (webhook_url, url_path)
+    - webhook_url: full https url for telegram setWebhook
+    - url_path: path for local server
+    """
+    url_path = WEBHOOK_PATH or "webhook"
+
+    # If user sets full webhook URL, use it
+    if WEBHOOK_URL:
+        # Ensure it ends with "/<path>" if they forgot
+        if WEBHOOK_URL.rstrip("/").endswith("/" + url_path):
+            return WEBHOOK_URL.rstrip("/"), url_path
+        return WEBHOOK_URL.rstrip("/") + "/" + url_path, url_path
+
+    # Else build from base
+    if not WEBHOOK_BASE:
+        raise SystemExit(
+            "❌ Missing WEBHOOK_BASE or WEBHOOK_URL.\n"
+            "Ví dụ WEBHOOK_BASE=https://your-app.onrender.com"
+        )
+
+    return WEBHOOK_BASE.rstrip("/") + "/" + url_path, url_path
+
+
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Bạn chưa set BOT_TOKEN trên Railway Variables.")
+        raise SystemExit("❌ Bạn chưa set BOT_TOKEN trên Render Variables.")
+    if not DATABASE_URL:
+        raise SystemExit("❌ Bạn chưa set DATABASE_URL (PostgreSQL).")
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    webhook_url, url_path = build_webhook_url()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("listpay", listpay))
     app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
-    print("✅ Bot is running (polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("✅ Bot is running (webhook)...")
+    print("Webhook URL:", webhook_url)
+
+    # run_webhook sẽ tự setWebhook khi truyền webhook_url
+    # secret_token (nếu set) để Telegram gửi header bảo mật
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=url_path,          # local path
+        webhook_url=webhook_url,    # public https url
+        secret_token=WEBHOOK_SECRET_TOKEN or None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
