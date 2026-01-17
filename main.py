@@ -440,10 +440,12 @@ def main():
     app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
     if WEBHOOK_URL:
+        # Render Web Service: phải bind đúng PORT
         webhook_path = "/webhook"
         full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
-
+    
         print("✅ Bot is running (webhook)...", full_webhook_url)
+    
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -455,6 +457,6 @@ def main():
         print("✅ Bot is running (polling)...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
     main()
+
