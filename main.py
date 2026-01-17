@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-import aiosqlite
+import asyncpg
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -23,14 +23,15 @@ PAYMENT_CHAT_ID = int(os.getenv("PAYMENT_CHAT_ID", "0") or 0)
 PAYMENT_THREAD_ID = int(os.getenv("PAYMENT_THREAD_ID", "0") or 0)
 PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "").strip()
 
-# Render Persistent Disk (gợi ý mount: /var/data)
-DB_PATH = os.getenv("DB_PATH", "/var/data/pay_codes.sqlite3").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Webhook mode (tuỳ chọn)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # ví dụ: https://xxx.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000") or 10000)
 
 PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
+
+# Global pool
+DB_POOL: asyncpg.Pool | None = None
 
 
 def now_iso() -> str:
@@ -47,57 +48,50 @@ def norm_username(u: str | None) -> str:
 
 
 async def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS pay_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    """
+    Với Supabase: bạn đã tạo table bằng SQL Editor rồi.
+    Hàm này chỉ đảm bảo kết nối và tạo pool.
+    """
+    global DB_POOL
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
 
-            chat_id INTEGER NOT NULL,
-            thread_id INTEGER NOT NULL,
-            pay_message_id INTEGER NOT NULL,
+    # Supabase/pgBouncer đôi khi cần timeout cao hơn
+    DB_POOL = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
+    )
 
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            full_name TEXT,
-
-            code TEXT NOT NULL,
-            attempt_no INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-
-            done INTEGER NOT NULL DEFAULT 0,
-            done_at TEXT,
-            done_by INTEGER
-        )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_code ON pay_codes(code)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_user ON pay_codes(user_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_pay_done ON pay_codes(done)")
-        await db.commit()
+    # Kiểm tra kết nối nhanh
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("select 1;")
 
 
-async def get_next_attempt_no(db, user_id: int) -> int:
-    cur = await db.execute("SELECT COUNT(*) FROM pay_codes WHERE user_id=?", (user_id,))
-    row = await cur.fetchone()
-    return int(row[0] or 0) + 1
+async def get_next_attempt_no(user_id: int) -> int:
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        cnt = await conn.fetchval("select count(*) from pay_codes where user_id=$1", user_id)
+        return int(cnt or 0) + 1
 
 
 async def get_last_identity(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
             """
-            SELECT full_name, username
-            FROM pay_codes
-            WHERE user_id=?
-            ORDER BY id DESC
-            LIMIT 1
+            select full_name, username
+            from pay_codes
+            where user_id=$1
+            order by id desc
+            limit 1
             """,
-            (user_id,),
+            user_id,
         )
-        row = await cur.fetchone()
         if not row:
             return None, None
-        return (row[0] or ""), (row[1] or "")
+        return (row["full_name"] or ""), (row["username"] or "")
 
 
 def is_admin(update: Update) -> bool:
@@ -129,10 +123,8 @@ def is_payment_topic(update: Update) -> bool:
 
 
 def should_ignore(update: Update) -> bool:
-    # private luôn xử lý (redirect)
     if is_private(update):
         return False
-    # group mà không đúng topic payment thì ignore
     return not is_payment_topic(update)
 
 
@@ -168,7 +160,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Private
     if is_private(update):
         if is_admin(update):
             await update.effective_message.reply_text(
@@ -204,29 +195,29 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        attempt_no = await get_next_attempt_no(db, user.id)
+    attempt_no = await get_next_attempt_no(user.id)
 
-        cur = await db.execute(
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        pay_id = await conn.fetchval(
             """
-            INSERT INTO pay_codes(chat_id, thread_id, pay_message_id, user_id, username, full_name,
-                                  code, attempt_no, created_at, done)
-            VALUES (?,?,?,?,?,?,?,?,?,0)
+            insert into pay_codes(
+              chat_id, thread_id, pay_message_id,
+              user_id, username, full_name,
+              code, attempt_no, created_at, done
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8, now(), false)
+            returning id
             """,
-            (
-                int(chat.id),
-                int(thread_id),
-                int(msg.message_id),
-                int(user.id),
-                norm_username(user.username),
-                user.full_name or "",
-                code,
-                attempt_no,
-                now_iso(),
-            ),
+            int(chat.id),
+            int(thread_id),
+            int(msg.message_id),
+            int(user.id),
+            norm_username(user.username),
+            user.full_name or "",
+            code,
+            int(attempt_no),
         )
-        pay_id = cur.lastrowid
-        await db.commit()
 
     await msg.reply_text(
         "<b>Mã thanh toán của bạn đã được ghi nhận!</b>\n"
@@ -309,30 +300,29 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Bad data", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
             """
-            SELECT id, chat_id, thread_id, pay_message_id, user_id, full_name, code, done
-            FROM pay_codes WHERE id=?
+            select id, chat_id, thread_id, pay_message_id, user_id, full_name, code, done
+            from pay_codes
+            where id=$1
             """,
-            (pay_id,),
+            pay_id,
         )
-        row = await cur.fetchone()
         if not row:
             await q.answer("Không tìm thấy record.", show_alert=True)
             return
 
-        (_id, chat_id, thread_id, pay_msg_id, user_id, full_name, code, done) = row
-
-        if int(done) == 1:
+        if bool(row["done"]):
             await q.answer("Mã này đã Done rồi.", show_alert=True)
             return
 
-        await db.execute(
-            "UPDATE pay_codes SET done=1, done_at=?, done_by=? WHERE id=?",
-            (now_iso(), ADMIN_CHAT_ID, pay_id),
+        await conn.execute(
+            "update pay_codes set done=true, done_at=now(), done_by=$1 where id=$2",
+            ADMIN_CHAT_ID,
+            pay_id,
         )
-        await db.commit()
 
     try:
         await q.edit_message_reply_markup(reply_markup=None)
@@ -340,6 +330,13 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await q.answer("✅ Marked as Done!")
+
+    chat_id = int(row["chat_id"])
+    thread_id = int(row["thread_id"])
+    pay_msg_id = int(row["pay_message_id"])
+    user_id = int(row["user_id"])
+    full_name = row["full_name"] or ""
+    code = row["code"] or ""
 
     text = (
         "<b>Đã thanh toán thành công!</b>\n"
@@ -349,21 +346,20 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "</blockquote>"
     )
 
-    # trả lời vào đúng topic + reply vào tin /pay nếu được
     try:
         await context.bot.send_message(
-            chat_id=int(chat_id),
-            message_thread_id=int(thread_id),
+            chat_id=chat_id,
+            message_thread_id=thread_id,
             text=text,
             parse_mode=ParseMode.HTML,
-            reply_to_message_id=int(pay_msg_id),
+            reply_to_message_id=pay_msg_id,
             disable_web_page_preview=True,
         )
     except Exception as e:
         print("Send to payment topic failed:", repr(e))
         await context.bot.send_message(
-            chat_id=int(chat_id),
-            message_thread_id=int(thread_id),
+            chat_id=chat_id,
+            message_thread_id=thread_id,
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -374,13 +370,15 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update) or not is_admin(update):
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT code, user_id, full_name, username, created_at, done
-            FROM pay_codes
-            ORDER BY id DESC
-        """)
-        rows = await cur.fetchall()
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select code, user_id, full_name, username, created_at, done
+            from pay_codes
+            order by id desc
+            """
+        )
 
     if not rows:
         await update.effective_message.reply_text("Chưa có mã nào.")
@@ -396,14 +394,15 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = ""
     part = 1
 
-    def fmt_row(code, user_id, full_name, username, created_at, done):
-        st = "DONE" if int(done) == 1 else "PENDING"
-        user_mention = mention_user(int(user_id), full_name)
-        uname = f"@{norm_username(username)}" if username else ""
-        return f"• <code>{code}</code> — {user_mention} {uname} — <b>{st}</b> — {created_at}\n"
+    def fmt_row(r):
+        st = "DONE" if bool(r["done"]) else "PENDING"
+        user_mention = mention_user(int(r["user_id"]), r["full_name"] or "")
+        uname = f"@{norm_username(r['username'])}" if r["username"] else ""
+        created = str(r["created_at"])
+        return f"• <code>{r['code']}</code> — {user_mention} {uname} — <b>{st}</b> — {created}\n"
 
     for r in rows:
-        line = fmt_row(*r)
+        line = fmt_row(r)
         if len(buf) + len(line) > MAX_LEN:
             await update.effective_message.reply_text(
                 f"<b>Trang {part}</b>\n{buf}",
@@ -413,7 +412,6 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             part += 1
             buf = ""
             await asyncio.sleep(0.6)
-
         buf += line
 
     if buf.strip():
@@ -430,7 +428,9 @@ async def post_init(app: Application):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Missing BOT_TOKEN (set ENV on Render).")
+        raise SystemExit("❌ Missing BOT_TOKEN")
+    if not DATABASE_URL:
+        raise SystemExit("❌ Missing DATABASE_URL")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -439,10 +439,7 @@ def main():
     app.add_handler(CommandHandler("listpay", listpay))
     app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
-    # ========= MODE =========
     if WEBHOOK_URL:
-        # Webhook mode: Render chạy service web
-        # Lưu ý: WEBHOOK_URL = base url (không có /webhook) hoặc có cũng được, dưới mình set path "/webhook"
         webhook_path = "/webhook"
         full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
 
@@ -455,7 +452,6 @@ def main():
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # Polling mode: đơn giản nhất, dùng Background Worker
         print("✅ Bot is running (polling)...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
