@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import asyncpg
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
@@ -21,7 +21,10 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
 
 PAYMENT_CHAT_ID = int(os.getenv("PAYMENT_CHAT_ID", "0") or 0)
 PAYMENT_THREAD_ID = int(os.getenv("PAYMENT_THREAD_ID", "0") or 0)
-PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "").strip()
+
+# ✅ default link mới (nếu ENV trống)
+DEFAULT_PAYMENT_TOPIC_LINK = "https://t.me/shortlinkpanel_group/54"
+PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "").strip() or DEFAULT_PAYMENT_TOPIC_LINK
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -34,7 +37,7 @@ PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
 DB_POOL: asyncpg.Pool | None = None
 DB_READY = asyncio.Event()
 
-# (optional) anti-spam cooldown: cùng 1 user gửi /pay liên tục
+# Anti spam cooldown (optional)
 ENABLE_USER_COOLDOWN = True
 USER_COOLDOWN_SECONDS = 20
 _last_pay_time: dict[int, datetime] = {}
@@ -114,11 +117,6 @@ async def get_last_identity(user_id: int):
 
 
 async def find_code_status(code: str):
-    """
-    Trả về:
-      - None nếu code chưa tồn tại
-      - dict nếu tồn tại: {done: bool, user_id, full_name, created_at, done_at}
-    """
     if DB_POOL is None:
         return None
     async with DB_POOL.acquire() as conn:
@@ -144,12 +142,11 @@ async def find_code_status(code: str):
         }
 
 
-async def insert_pay_request(chat_id: int, thread_id: int, pay_message_id: int,
-                            user_id: int, username: str, full_name: str,
-                            code: str, attempt_no: int) -> int:
-    """
-    Insert sau khi đã check trùng.
-    """
+async def insert_pay_request(
+    chat_id: int, thread_id: int, pay_message_id: int,
+    user_id: int, username: str, full_name: str,
+    code: str, attempt_no: int
+) -> int:
     assert DB_POOL is not None
     async with DB_POOL.acquire() as conn:
         pay_id = await conn.fetchval(
@@ -213,7 +210,7 @@ async def redirect_private(update: Update):
         "<b>Không hỗ trợ tại đây!</b>\n"
         "<blockquote>"
         "• Vui lòng tham gia group để tiếp tục: "
-        f"<a href='{PAYMENT_TOPIC_LINK}'>Tham gia</a>\n\n"
+        f"<a href='{PAYMENT_TOPIC_LINK}'>Tham gia Topic Payment</a>\n\n"
         "• Lệnh: /pay + mã rút tiền\n"
         "• Ví dụ: <code>/pay P0321669</code>"
         "</blockquote>",
@@ -270,24 +267,20 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
-
-
     code = (context.args[0] or "").strip().upper()
     if not PAY_RE.match(code):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
-    # ✅ ensure DB ready
     ok = await ensure_db_ready()
     if not ok:
         await msg.reply_text(
-            "⚠️ Database đang khởi động hoặc lỗi kết nối.\n"
-            "Vui lòng thử lại sau 10-20 giây.",
+            "⚠️ Database đang khởi động hoặc lỗi kết nối.\nVui lòng thử lại sau 10-20 giây.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # ✅ optional cooldown per user
+    # cooldown
     if ENABLE_USER_COOLDOWN:
         t = _last_pay_time.get(user.id)
         if t and (now_utc() - t).total_seconds() < USER_COOLDOWN_SECONDS:
@@ -298,10 +291,9 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         _last_pay_time[user.id] = now_utc()
 
-    # ✅ CHẶN TRÙNG MÃ
+    # ✅ chặn trùng code
     existed = await find_code_status(code)
     if existed is not None:
-        # code đã từng được submit
         if existed["done"]:
             await msg.reply_text(
                 "<b>❌ Mã này đã được thanh toán trước đó!</b>\n"
@@ -358,17 +350,14 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur_username = norm_username(user.username)
         last_username_norm = norm_username(last_username)
 
-        name_changed = bool(last_full_name) and (last_full_name != cur_full_name)
-        username_changed = bool(last_username) and (last_username_norm != cur_username)
-
         warn_lines = []
-        if name_changed:
+        if last_full_name and last_full_name != cur_full_name:
             warn_lines.append(
                 "⚠️ <b>Cảnh báo:</b> User có dấu hiệu <b>đổi tên</b>\n"
                 f"• Trước: <code>{last_full_name}</code>\n"
                 f"• Nay: <code>{cur_full_name}</code>"
             )
-        if username_changed:
+        if last_username and (last_username_norm != cur_username):
             warn_lines.append(
                 "⚠️ <b>Cảnh báo:</b> User có dấu hiệu <b>đổi username</b>\n"
                 f"• Trước: <code>@{last_username_norm}</code>\n"
@@ -427,6 +416,7 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("DB chưa sẵn sàng, thử lại sau.", show_alert=True)
         return
 
+    assert DB_POOL is not None
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -504,6 +494,7 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    assert DB_POOL is not None
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -567,6 +558,7 @@ def main():
 
     print("PORT =", PORT)
     print("WEBHOOK_URL =", WEBHOOK_URL or "(empty)")
+    print("PAYMENT_TOPIC_LINK =", PAYMENT_TOPIC_LINK)
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
