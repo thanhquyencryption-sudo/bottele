@@ -13,7 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# ✅ thêm aiohttp web route
+# ✅ aiohttp routes for healthcheck
 from aiohttp import web
 
 # =========================
@@ -396,7 +396,10 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_mention = mention_user(int(r["user_id"]), r["full_name"] or "")
         uname = f"@{norm_username(r['username'])}" if r["username"] else ""
         created = str(r["created_at"])
-        return f"• <code>{r['code']}</code> — {user_mention} {uname} — <b>{st}</b> — {created}\n"
+        return (
+            f"• <code>{r['code']}</code> — {user_mention} {uname} — "
+            f"<b>{st}</b> — {created}\n"
+        )
 
     for r in rows:
         line = fmt_row(r)
@@ -423,12 +426,13 @@ async def post_init(app: Application):
     await init_db()
 
 
-# ✅ health handlers (đỡ 404)
+# ✅ HTTP handlers
 async def http_root(_request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
+
 async def http_webhook_get(_request: web.Request) -> web.Response:
-    # để bạn mở /webhook trong browser thấy OK (Telegram vẫn POST)
+    # cho bạn mở /webhook bằng browser thấy OK (Telegram vẫn POST)
     return web.Response(text="OK")
 
 
@@ -437,6 +441,10 @@ def main():
         raise SystemExit("❌ Missing BOT_TOKEN")
     if not DATABASE_URL:
         raise SystemExit("❌ Missing DATABASE_URL")
+
+    # ✅ log để biết ENV có vào không
+    print("PORT =", PORT)
+    print("WEBHOOK_URL =", WEBHOOK_URL or "(empty)")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -449,7 +457,7 @@ def main():
         webhook_path = "/webhook"
         full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
 
-        # ✅ add route GET / and /health and GET /webhook
+        # ✅ health routes
         app.webhook_app.router.add_get("/", http_root)
         app.webhook_app.router.add_get("/health", http_root)
         app.webhook_app.router.add_get("/webhook", http_webhook_get)
@@ -467,6 +475,7 @@ def main():
     else:
         print("✅ Bot is running (polling)...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
