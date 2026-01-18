@@ -13,6 +13,9 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
+# ✅ thêm aiohttp web route
+from aiohttp import web
+
 # =========================
 # CONFIG (Render ENV)
 # =========================
@@ -48,15 +51,10 @@ def norm_username(u: str | None) -> str:
 
 
 async def init_db():
-    """
-    Với Supabase: bạn đã tạo table bằng SQL Editor rồi.
-    Hàm này chỉ đảm bảo kết nối và tạo pool.
-    """
     global DB_POOL
     if not DATABASE_URL:
         raise RuntimeError("Missing DATABASE_URL")
 
-    # Supabase/pgBouncer đôi khi cần timeout cao hơn
     DB_POOL = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
@@ -64,7 +62,6 @@ async def init_db():
         command_timeout=30,
     )
 
-    # Kiểm tra kết nối nhanh
     async with DB_POOL.acquire() as conn:
         await conn.execute("select 1;")
 
@@ -426,6 +423,15 @@ async def post_init(app: Application):
     await init_db()
 
 
+# ✅ health handlers (đỡ 404)
+async def http_root(_request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+async def http_webhook_get(_request: web.Request) -> web.Response:
+    # để bạn mở /webhook trong browser thấy OK (Telegram vẫn POST)
+    return web.Response(text="OK")
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ Missing BOT_TOKEN")
@@ -440,18 +446,23 @@ def main():
     app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
     if WEBHOOK_URL:
-        # Render Web Service: phải bind đúng PORT
         webhook_path = "/webhook"
         full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
-    
+
+        # ✅ add route GET / and /health and GET /webhook
+        app.webhook_app.router.add_get("/", http_root)
+        app.webhook_app.router.add_get("/health", http_root)
+        app.webhook_app.router.add_get("/webhook", http_webhook_get)
+
         print("✅ Bot is running (webhook)...", full_webhook_url)
-    
+
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path="webhook",
             webhook_url=full_webhook_url,
             allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
         )
     else:
         print("✅ Bot is running (polling)...")
@@ -459,4 +470,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
