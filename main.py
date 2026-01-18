@@ -1,11 +1,8 @@
 import os
 import re
 import asyncio
-import json
 import asyncpg
 from datetime import datetime, timezone
-
-from aiohttp import web
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
@@ -28,12 +25,14 @@ PAYMENT_TOPIC_LINK = os.getenv("PAYMENT_TOPIC_LINK", "").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # e.g. https://xxx.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000") or 10000)
 
 PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
 
+# Global pool + ready flag
 DB_POOL: asyncpg.Pool | None = None
+DB_READY = asyncio.Event()
 
 
 def now_iso() -> str:
@@ -50,29 +49,56 @@ def norm_username(u: str | None) -> str:
 
 
 async def init_db():
+    """
+    Init asyncpg pool. Nếu fail, bot vẫn chạy nhưng /pay sẽ báo "DB đang khởi động/lỗi".
+    """
     global DB_POOL
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL")
 
-    DB_POOL = await asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
-    )
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("select 1;")
+    if not DATABASE_URL:
+        print("❌ Missing DATABASE_URL")
+        return
+
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+        )
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("select 1;")
+        DB_READY.set()
+        print("✅ DB ready")
+    except Exception as e:
+        DB_POOL = None
+        print("❌ init_db failed:", repr(e))
+        # không set DB_READY
+
+
+async def ensure_db_ready(timeout: float = 8.0) -> bool:
+    """
+    Chờ DB_READY trong vài giây. Trả False nếu timeout hoặc pool None.
+    """
+    if DB_READY.is_set() and DB_POOL is not None:
+        return True
+    try:
+        await asyncio.wait_for(DB_READY.wait(), timeout=timeout)
+        return DB_POOL is not None
+    except asyncio.TimeoutError:
+        return False
 
 
 async def get_next_attempt_no(user_id: int) -> int:
-    assert DB_POOL is not None
+    if DB_POOL is None:
+        return 1
     async with DB_POOL.acquire() as conn:
         cnt = await conn.fetchval("select count(*) from pay_codes where user_id=$1", user_id)
         return int(cnt or 0) + 1
 
 
 async def get_last_identity(user_id: int):
-    assert DB_POOL is not None
+    if DB_POOL is None:
+        return None, None
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -190,9 +216,19 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
+    # ✅ ensure DB ready
+    ok = await ensure_db_ready()
+    if not ok:
+        await msg.reply_text(
+            "⚠️ Database đang khởi động hoặc lỗi kết nối.\n"
+            "Vui lòng thử lại sau 10-20 giây.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     attempt_no = await get_next_attempt_no(user.id)
 
-    assert DB_POOL is not None
+    # insert
     async with DB_POOL.acquire() as conn:
         pay_id = await conn.fetchval(
             """
@@ -295,7 +331,11 @@ async def on_pay_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Bad data", show_alert=True)
         return
 
-    assert DB_POOL is not None
+    ok = await ensure_db_ready()
+    if not ok:
+        await q.answer("DB chưa sẵn sàng, thử lại sau.", show_alert=True)
+        return
+
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -365,7 +405,14 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update) or not is_admin(update):
         return
 
-    assert DB_POOL is not None
+    ok = await ensure_db_ready()
+    if not ok:
+        await update.effective_message.reply_text(
+            "⚠️ Database chưa sẵn sàng. Thử lại sau 10-20 giây.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -417,59 +464,12 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# =========================
-# AIOHTTP SERVER (health + webhook)
-# =========================
-async def http_root(_request: web.Request) -> web.Response:
-    return web.Response(text="OK")
-
-
-async def http_health(_request: web.Request) -> web.Response:
-    return web.Response(text="OK")
-
-
-async def telegram_webhook(request: web.Request) -> web.Response:
-    """Telegram POST update here -> push to PTB queue."""
-    app: Application = request.app["ptb_app"]
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
-
-    try:
-        update = Update.de_json(data, app.bot)
-    except Exception as e:
-        print("Update parse error:", repr(e))
-        return web.Response(status=400, text="bad update")
-
-    # put update for PTB to process
-    await app.update_queue.put(update)
-    return web.Response(text="OK")
-
-
 async def post_init(app: Application):
+    # init DB once at startup
     await init_db()
 
 
-async def run_aiohttp_server(ptb_app: Application):
-    """Start aiohttp server that Render can detect."""
-    web_app = web.Application()
-    web_app["ptb_app"] = ptb_app
-
-    web_app.router.add_get("/", http_root)
-    web_app.router.add_get("/health", http_health)
-    web_app.router.add_get("/webhook", http_health)  # allow browser GET test
-    web_app.router.add_post("/webhook", telegram_webhook)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-
-    print(f"✅ aiohttp listening on 0.0.0.0:{PORT}")
-
-
-async def main_async():
+def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ Missing BOT_TOKEN")
     if not DATABASE_URL:
@@ -478,34 +478,30 @@ async def main_async():
     print("PORT =", PORT)
     print("WEBHOOK_URL =", WEBHOOK_URL or "(empty)")
 
-    ptb_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("pay", pay))
-    ptb_app.add_handler(CommandHandler("listpay", listpay))
-    ptb_app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("listpay", listpay))
+    app.add_handler(CallbackQueryHandler(on_pay_done, pattern=r"^pay_done:\d+$"))
 
-    # Start PTB internal machinery (dispatcher etc.)
-    await ptb_app.initialize()
-    await ptb_app.start()
-
-    # Start aiohttp server so Render detects an open port
-    await run_aiohttp_server(ptb_app)
-
-    # Set webhook to our endpoint
     if WEBHOOK_URL:
-        full_webhook_url = WEBHOOK_URL.rstrip("/") + "/webhook"
-        await ptb_app.bot.set_webhook(url=full_webhook_url, drop_pending_updates=True)
-        print("✅ Webhook set to:", full_webhook_url)
+        webhook_path = "/webhook"
+        full_webhook_url = WEBHOOK_URL.rstrip("/") + webhook_path
+
+        print("✅ Bot is running (webhook)...", full_webhook_url)
+
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=full_webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
     else:
-        print("⚠️ WEBHOOK_URL empty: webhook not set. (You should set it on Render.)")
-
-    # Keep running forever
-    await asyncio.Event().wait()
-
-
-def main():
-    asyncio.run(main_async())
+        print("✅ Bot is running (polling)...")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
