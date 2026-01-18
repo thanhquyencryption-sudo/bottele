@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 import asyncpg
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
@@ -34,9 +34,14 @@ PAY_RE = re.compile(r"^P\d{7}$")  # /pay P1234567
 DB_POOL: asyncpg.Pool | None = None
 DB_READY = asyncio.Event()
 
+# (optional) anti-spam cooldown: cùng 1 user gửi /pay liên tục
+ENABLE_USER_COOLDOWN = True
+USER_COOLDOWN_SECONDS = 20
+_last_pay_time: dict[int, datetime] = {}
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def mention_user(user_id: int, full_name: str) -> str:
@@ -49,9 +54,6 @@ def norm_username(u: str | None) -> str:
 
 
 async def init_db():
-    """
-    Init asyncpg pool. Nếu fail, bot vẫn chạy nhưng /pay sẽ báo "DB đang khởi động/lỗi".
-    """
     global DB_POOL
 
     if not DATABASE_URL:
@@ -72,13 +74,9 @@ async def init_db():
     except Exception as e:
         DB_POOL = None
         print("❌ init_db failed:", repr(e))
-        # không set DB_READY
 
 
 async def ensure_db_ready(timeout: float = 8.0) -> bool:
-    """
-    Chờ DB_READY trong vài giây. Trả False nếu timeout hoặc pool None.
-    """
     if DB_READY.is_set() and DB_POOL is not None:
         return True
     try:
@@ -113,6 +111,67 @@ async def get_last_identity(user_id: int):
         if not row:
             return None, None
         return (row["full_name"] or ""), (row["username"] or "")
+
+
+async def find_code_status(code: str):
+    """
+    Trả về:
+      - None nếu code chưa tồn tại
+      - dict nếu tồn tại: {done: bool, user_id, full_name, created_at, done_at}
+    """
+    if DB_POOL is None:
+        return None
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select code, done, user_id, full_name, created_at, done_at
+            from pay_codes
+            where code=$1
+            order by id desc
+            limit 1
+            """,
+            code,
+        )
+        if not row:
+            return None
+        return {
+            "code": row["code"],
+            "done": bool(row["done"]),
+            "user_id": int(row["user_id"]),
+            "full_name": row["full_name"] or "",
+            "created_at": row["created_at"],
+            "done_at": row["done_at"],
+        }
+
+
+async def insert_pay_request(chat_id: int, thread_id: int, pay_message_id: int,
+                            user_id: int, username: str, full_name: str,
+                            code: str, attempt_no: int) -> int:
+    """
+    Insert sau khi đã check trùng.
+    """
+    assert DB_POOL is not None
+    async with DB_POOL.acquire() as conn:
+        pay_id = await conn.fetchval(
+            """
+            insert into pay_codes(
+              chat_id, thread_id, pay_message_id,
+              user_id, username, full_name,
+              code, attempt_no, created_at, done
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8, now(), false)
+            returning id
+            """,
+            int(chat_id),
+            int(thread_id),
+            int(pay_message_id),
+            int(user_id),
+            username,
+            full_name,
+            code,
+            int(attempt_no),
+        )
+        return int(pay_id)
 
 
 def is_admin(update: Update) -> bool:
@@ -211,7 +270,9 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
 
-    code = (context.args[0] or "").strip()
+
+
+    code = (context.args[0] or "").strip().upper()
     if not PAY_RE.match(code):
         await msg.reply_text(warn_text, parse_mode=ParseMode.HTML)
         return
@@ -226,29 +287,59 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ✅ optional cooldown per user
+    if ENABLE_USER_COOLDOWN:
+        t = _last_pay_time.get(user.id)
+        if t and (now_utc() - t).total_seconds() < USER_COOLDOWN_SECONDS:
+            await msg.reply_text(
+                f"⏳ Bạn thao tác quá nhanh. Vui lòng thử lại sau <b>{USER_COOLDOWN_SECONDS}</b> giây.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _last_pay_time[user.id] = now_utc()
+
+    # ✅ CHẶN TRÙNG MÃ
+    existed = await find_code_status(code)
+    if existed is not None:
+        # code đã từng được submit
+        if existed["done"]:
+            await msg.reply_text(
+                "<b>❌ Mã này đã được thanh toán trước đó!</b>\n"
+                "<blockquote>"
+                f"• Code: <code>{code}</code>\n"
+                f"• Trạng thái: <b>DONE</b>\n"
+                f"• Người submit trước: {mention_user(existed['user_id'], existed['full_name'])}"
+                "</blockquote>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        else:
+            await msg.reply_text(
+                "<b>⚠️ Mã này đang chờ duyệt!</b>\n"
+                "<blockquote>"
+                f"• Code: <code>{code}</code>\n"
+                f"• Trạng thái: <b>PENDING</b>\n"
+                f"• Người submit trước: {mention_user(existed['user_id'], existed['full_name'])}\n"
+                "• Vui lòng <b>không gửi trùng</b>. Admin sẽ xử lý theo lượt."
+                "</blockquote>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+
     attempt_no = await get_next_attempt_no(user.id)
 
-    # insert
-    async with DB_POOL.acquire() as conn:
-        pay_id = await conn.fetchval(
-            """
-            insert into pay_codes(
-              chat_id, thread_id, pay_message_id,
-              user_id, username, full_name,
-              code, attempt_no, created_at, done
-            )
-            values ($1,$2,$3,$4,$5,$6,$7,$8, now(), false)
-            returning id
-            """,
-            int(chat.id),
-            int(thread_id),
-            int(msg.message_id),
-            int(user.id),
-            norm_username(user.username),
-            user.full_name or "",
-            code,
-            int(attempt_no),
-        )
+    pay_id = await insert_pay_request(
+        chat_id=int(chat.id),
+        thread_id=int(thread_id),
+        pay_message_id=int(msg.message_id),
+        user_id=int(user.id),
+        username=norm_username(user.username),
+        full_name=user.full_name or "",
+        code=code,
+        attempt_no=int(attempt_no),
+    )
 
     await msg.reply_text(
         "<b>Mã thanh toán của bạn đã được ghi nhận!</b>\n"
@@ -465,7 +556,6 @@ async def listpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    # init DB once at startup
     await init_db()
 
 
